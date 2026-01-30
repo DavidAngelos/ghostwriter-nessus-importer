@@ -138,6 +138,7 @@ class NessusParser:
             raise ValueError(f"Failed to parse XML: {e}")
 
         root = tree.getroot()
+        report = root.find("Report")
         if report is None:
             report = root.find(".//Report")
         if report is None:
@@ -401,6 +402,9 @@ def main():
         count = 0
         with open(output_file, "w", encoding="utf-8") as f:
             for finding in parser_obj.to_jsonl_iter():
+                # Redact sensitive info for AI workflow
+                finding["affectedEntities"] = ""
+                finding["replication_steps"] = ""
                 f.write(json.dumps(finding) + "\n")
                 count += 1
         logger.info(f"Extracted {count} findings.")
@@ -413,27 +417,80 @@ def main():
 
         source_findings = []
         
-        # Load from JSONL if provided
+        # Load sources into maps for merging
+        jsonl_findings_map = {}
+        nessus_findings_map = {}
+
+        # 1. Load JSONL (Enrichment Source - AI-edited text)
         if args.jsonl:
-            logger.info(f"Loading findings from {args.jsonl}...")
+            logger.info(f"Loading enrichment data from {args.jsonl}...")
             if not os.path.exists(args.jsonl):
                 logger.error(f"File not found: {args.jsonl}")
                 sys.exit(1)
             with open(args.jsonl, "r", encoding="utf-8") as f:
                 for line in f:
                     if line.strip():
-                        source_findings.append(json.loads(line))
-        # Or load direct from Nessus (Legacy/Convenience flow)
-        elif args.nessus:
-            logger.info(f"Parsing {args.nessus} for direct import...")
+                        obj = json.loads(line)
+                        if "plugin_id" in obj:
+                            jsonl_findings_map[obj["plugin_id"]] = obj
+        
+        # 2. Load Nessus (Technical Source - hosts, outputs, etc.)
+        if args.nessus:
+            logger.info(f"Parsing {args.nessus} for technical data (hosts/outputs)...")
             if not os.path.exists(args.nessus):
                 logger.error(f"File not found: {args.nessus}")
                 sys.exit(1)
             parser_obj = NessusParser(args.nessus)
             parser_obj.parse()
-            source_findings = list(parser_obj.to_jsonl_iter())
+            for obj in parser_obj.to_jsonl_iter():
+                nessus_findings_map[obj["plugin_id"]] = obj
+
+        # 3. Merge Strategy
+        if args.jsonl and args.nessus:
+            logger.info("Merging Nessus technical data with JSONL enrichment...")
+            # Nessus provides: affectedEntities, replication_steps (technical data)
+            # JSONL provides: title, description, mitigation (AI-enriched text)
+            
+            for pid, tech_finding in nessus_findings_map.items():
+                if pid in jsonl_findings_map:
+                    enrichment = jsonl_findings_map[pid]
+                    merged = tech_finding.copy()
+                    
+                    # Overlay enriched text fields from JSONL
+                    merged["title"] = enrichment.get("title", merged["title"])
+                    merged["description"] = enrichment.get("description", merged["description"])
+                    merged["mitigation"] = enrichment.get("mitigation", merged["mitigation"])
+                    merged["impact"] = enrichment.get("impact", merged["impact"])
+                    merged["references"] = enrichment.get("references", merged["references"])
+                    merged["severity_label"] = enrichment.get("severity_label", merged["severity_label"])
+                    merged["extraFields"] = enrichment.get("extraFields", merged.get("extraFields"))
+                    
+                    # Only override technical data if JSONL explicitly provides non-empty values
+                    if enrichment.get("affectedEntities"):
+                        merged["affectedEntities"] = enrichment["affectedEntities"]
+                    if enrichment.get("replication_steps"):
+                        merged["replication_steps"] = enrichment["replication_steps"]
+                        
+                    source_findings.append(merged)
+                else:
+                    # In Nessus but not in JSONL - import as-is
+                    source_findings.append(tech_finding)
+            
+            # Check for findings in JSONL but NOT in Nessus (manual additions)
+            for pid, enrich in jsonl_findings_map.items():
+                if pid not in nessus_findings_map:
+                    source_findings.append(enrich)
+
+        # Case: Only JSONL provided
+        elif args.jsonl:
+            source_findings = list(jsonl_findings_map.values())
+            
+        # Case: Only Nessus provided
+        elif args.nessus:
+             source_findings = list(nessus_findings_map.values())
+             
         else:
-            parser.error("--import-findings requires either --jsonl or --nessus input")
+            parser.error("--import-findings requires either --jsonl or --nessus input (or both for merge!)")
 
         Q_GET_REPORT_FINDINGS = """
 query GetReportFindings($reportId: bigint!) {
@@ -491,9 +548,9 @@ mutation CreateReportedFindings($objects: [reportedFinding_insert_input!]!) {
                 "description": finding["description"],
                 "mitigation": finding["mitigation"],
                 "impact": finding["impact"],
-                "replication_steps": finding["replication_steps"],
-                "affectedEntities": finding["affectedEntities"],
-                "references": finding["references"],
+                "replication_steps": finding.get("replication_steps", ""),
+                "affectedEntities": finding.get("affectedEntities", ""),
+                "references": finding.get("references", "<p></p>"),
                 "extraFields": finding.get("extraFields", {})
             }
             if "extraFields" not in finding:
