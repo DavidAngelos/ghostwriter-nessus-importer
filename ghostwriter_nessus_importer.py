@@ -4,11 +4,29 @@ import json
 import time
 import html
 import sys
+import logging
+import os
 import xml.etree.ElementTree as ET
+from typing import Dict, List, Optional, Generator, Any
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+
+# --- Logging Configuration ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stderr)]
+)
+logger = logging.getLogger("gw_nessus")
 
 
 # --- Constants & GraphQL ---
@@ -21,16 +39,34 @@ Q_SEVERITIES = """
 query ListSeverities { findingSeverity { id severity } }
 """
 
+Q_FIND_BY_TITLE = """
+query FindByTitle($reportId: bigint!, $title: String!) {
+  reportedFinding(where: {reportId: {_eq: $reportId}, title: {_eq: $title}}) {
+    id
+    title
+  }
+}
+"""
+
 M_INSERT = """
 mutation CreateReportedFinding($obj: reportedFinding_insert_input!) {
   insert_reportedFinding_one(object: $obj) { id title }
 }
 """
 
+M_UPDATE = """
+mutation UpdateReportedFinding($id: bigint!, $obj: reportedFinding_set_input!) {
+  update_reportedFinding_by_pk(pk_columns: {id: $id}, _set: $obj) {
+    id
+    title
+  }
+}
+"""
+
 
 # --- Helper Functions (Formatting) ---
 
-def to_richtext_html(text: str) -> str:
+def to_richtext_html(text: Optional[str]) -> str:
     """
     Convert plain text to safe HTML that Ghostwriter's DOCX exporter can handle.
     - Escapes <, >, &, quotes
@@ -60,7 +96,7 @@ def to_richtext_html(text: str) -> str:
     return "".join(paras) if paras else "<p></p>"
 
 
-def to_pre_blocks(outputs):
+def to_pre_blocks(outputs: List[str]) -> str:
     """
     plugin_output can be long. Render as <pre> blocks and keep it safe.
     """
@@ -76,7 +112,7 @@ def to_pre_blocks(outputs):
     return "<hr/>".join(blocks) if blocks else "<p></p>"
 
 
-def severity_label_from_nessus_num(n):
+def severity_label_from_nessus_num(n: int) -> str:
     # Nessus: 0=Info, 1=Low, 2=Medium, 3=High, 4=Critical
     return {4: "critical", 3: "high", 2: "medium", 1: "low", 0: "informational"}.get(n, "informational")
 
@@ -88,11 +124,11 @@ class NessusParser:
     Handles parsing of .nessus XML files and grouping findings by Plugin ID.
     Deterministic and offline.
     """
-    def __init__(self, source_path):
+    def __init__(self, source_path: str):
         self.source_path = source_path
-        self.findings = {}  # Dict[plugin_id] -> finding_dict
+        self.findings: Dict[int, Dict[str, Any]] = {}  # Dict[plugin_id] -> finding_dict
 
-    def parse(self):
+    def parse(self) -> Dict[int, Dict[str, Any]]:
         """
         Parses the Nessus file and populates self.findings.
         """
@@ -102,7 +138,8 @@ class NessusParser:
             raise ValueError(f"Failed to parse XML: {e}")
 
         root = tree.getroot()
-        report = root.find("Report") or root.find(".//Report")
+        if report is None:
+            report = root.find(".//Report")
         if report is None:
             raise ValueError("Could not find <Report> in .nessus file")
 
@@ -113,7 +150,7 @@ class NessusParser:
         
         return self.findings
 
-    def _process_item(self, item, host_name):
+    def _process_item(self, item: ET.Element, host_name: str):
         plugin_id = int(item.get("pluginID") or 0)
         plugin_name = item.get("pluginName") or "Unnamed Plugin"
         severity_num = int(item.get("severity") or 0)
@@ -157,7 +194,7 @@ class NessusParser:
         if out and len(p["outputs"]) < 2 and out not in p["outputs"]:
             p["outputs"].append(out)
 
-    def to_jsonl_iter(self):
+    def to_jsonl_iter(self) -> Generator[Dict[str, Any], None, None]:
         """
         Yields prepared finding objects ready for JSONL serialization.
         """
@@ -197,15 +234,16 @@ class GhostwriterImporter:
     """
     Handles connection to Ghostwriter and importing of findings.
     """
-    def __init__(self, gw_url, token, verify_ssl=False, timeout=60):
+    def __init__(self, gw_url: str, token: str, verify_ssl: bool = False, timeout: int = 60):
         self.gw_url = gw_url
         self.token = token
         self.verify_ssl = verify_ssl
         self.timeout = timeout
         self.session = self._build_session()
-        self.severity_map = {}
+        self.severity_map: Dict[str, int] = {}
+        self.existing_findings_cache: Dict[str, int] = {}
 
-    def _build_session(self):
+    def _build_session(self) -> requests.Session:
         s = requests.Session()
         retries = Retry(
             total=5,
@@ -219,7 +257,7 @@ class GhostwriterImporter:
         s.mount("https://", adapter)
         return s
 
-    def _gql(self, op_name, query, variables):
+    def _gql(self, op_name: str, query: str, variables: Dict[str, Any]) -> Dict[str, Any]:
         try:
             r = self.session.post(
                 self.gw_url,
@@ -243,28 +281,37 @@ class GhostwriterImporter:
 
     def connect_and_check_auth(self):
         me = self._gql("Whoami", Q_WHOAMI, {})
-        print(f"[+] Connected as: {me['whoami']['username']} ({me['whoami']['role']})")
+        logger.info(f"Connected as: {me['whoami']['username']} ({me['whoami']['role']})")
 
     def load_severity_map(self):
         data = self._gql("ListSeverities", Q_SEVERITIES, {})
         rows = data["findingSeverity"]
         self.severity_map = {r["severity"].lower(): int(r["id"]) for r in rows}
-        print(f"[+] Loaded severity IDs: {self.severity_map}")
+        logger.info(f"Loaded severity IDs: {self.severity_map}")
 
-    def import_finding(self, finding_data, report_id, finding_type_id=1, dry_run=False):
+    def check_existing_finding(self, report_id: int, title: str) -> Optional[int]:
         """
-        Import a single finding dictionary (structure matching NessusParser.to_jsonl_iter output)
+        Check existing findings from cache. O(1).
+        If cache is empty (e.g. dry run or first run), it returns None (inserts new).
+        """
+        return self.existing_findings_cache.get(title)
+
+    def import_finding(self, finding_data: Dict[str, Any], report_id: int, finding_type_id: int = 1, dry_run: bool = False):
+        """
+        Import a single finding dictionary (structure matching NessusParser.to_jsonl_iter output).
+        Checks for duplicates and UPDATES if found.
         """
         # Map severity label to ID
         sev_label = finding_data.get("severity_label", "informational")
         severity_id = self.severity_map.get(sev_label, self.severity_map.get("informational"))
+        title = finding_data["title"]
 
         # Construct payload
         obj = {
             "reportId": report_id,
             "findingTypeId": finding_type_id,
             "severityId": severity_id,
-            "title": finding_data["title"],
+            "title": title,
             "description": finding_data["description"],
             "mitigation": finding_data["mitigation"],
             "impact": finding_data["impact"],
@@ -284,13 +331,28 @@ class GhostwriterImporter:
              }
 
         if dry_run:
-            print(f"[Dry Run] Would insert: {obj['title']}")
+            logger.info(f"[Dry Run] Would insert/update: {title}")
             return
 
-        data = self._gql("CreateReportedFinding", M_INSERT, {"obj": obj})
-        rid = data["insert_reportedFinding_one"]["id"]
-        rtitle = data["insert_reportedFinding_one"]["title"]
-        print(f"[+] Created: {rid} - {rtitle}")
+        # Check for existence
+        existing_id = self.check_existing_finding(report_id, title)
+
+        if existing_id:
+            # UPDATE
+            # Can't update everything via 'object' in insert, need specific set
+            # For simplicity, we update the main fields. ReportID not needed in set.
+            update_obj = obj.copy()
+            del update_obj["reportId"] 
+            
+            data = self._gql("UpdateReportedFinding", M_UPDATE, {"id": existing_id, "obj": update_obj})
+            rtitle = data["update_reportedFinding_by_pk"]["title"]
+            logger.info(f"Updated: {existing_id} - {rtitle}")
+        else:
+            # INSERT
+            data = self._gql("CreateReportedFinding", M_INSERT, {"obj": obj})
+            rid = data["insert_reportedFinding_one"]["id"]
+            rtitle = data["insert_reportedFinding_one"]["title"]
+            logger.info(f"Created: {rid} - {rtitle}")
 
 
 # --- Main ---
@@ -307,11 +369,11 @@ def main():
     mode_group.add_argument("--extract", action="store_true", help="Parse .nessus and save to --jsonl")
     mode_group.add_argument("--import-findings", action="store_true", help="Import findings from --jsonl (or --nessus) to Ghostwriter")
     
-    # API args (only needed for import)
+    # API args (can come from Env)
     api_group = parser.add_argument_group("Ghostwriter API", "Required for --import-findings")
-    api_group.add_argument("--gw-url", help='e.g. "https://gw.example.com/v1/graphql"')
-    api_group.add_argument("--token", help="Bearer token (JWT)")
-    api_group.add_argument("--report-id", type=int, help="Target Report ID")
+    api_group.add_argument("--gw-url", default=os.getenv("GW_URL"), help='Start with https://...')
+    api_group.add_argument("--token", default=os.getenv("GW_TOKEN"), help="Bearer token")
+    api_group.add_argument("--report-id", type=int, default=os.getenv("GW_REPORT_ID"), help="Target Report ID")
     api_group.add_argument("--finding-type-id", type=int, default=1, help="findingTypeId (1=Network)")
     api_group.add_argument("--verify-ssl", action="store_true", help="Verify TLS cert")
     api_group.add_argument("--timeout", type=int, default=60, help="HTTP timeout")
@@ -325,62 +387,163 @@ def main():
         if not args.nessus:
             parser.error("--extract requires --nessus input file")
         
-        print(f"[*] Parsing {args.nessus}...")
-        parser_obj = NessusParser(args.nessus)
-        parser_obj.parse()
+        logger.info(f"Parsing {args.nessus}...")
+        try:
+            parser_obj = NessusParser(args.nessus)
+            parser_obj.parse()
+        except Exception as e:
+            logger.error(f"Failed to parse Nessus file: {e}")
+            sys.exit(1)
         
         output_file = args.jsonl or "nessus_findings.jsonl"
-        print(f"[*] Writing fields to {output_file}...")
+        logger.info(f"Writing fields to {output_file}...")
         
         count = 0
         with open(output_file, "w", encoding="utf-8") as f:
             for finding in parser_obj.to_jsonl_iter():
                 f.write(json.dumps(finding) + "\n")
                 count += 1
-        print(f"[+] Extracted {count} findings.")
+        logger.info(f"Extracted {count} findings.")
 
     # --- IMPORT MODE ---
     elif args.import_findings:
+        # Check required API args manually since ID/Token can be env
         if not all([args.gw_url, args.token, args.report_id]):
-            parser.error("--import-findings requires --gw-url, --token, and --report-id")
+            parser.error("--import-findings requires --gw-url, --token, and --report-id (via CLI or ENV)")
 
         source_findings = []
         
         # Load from JSONL if provided
         if args.jsonl:
-            print(f"[*] Loading findings from {args.jsonl}...")
+            logger.info(f"Loading findings from {args.jsonl}...")
+            if not os.path.exists(args.jsonl):
+                logger.error(f"File not found: {args.jsonl}")
+                sys.exit(1)
             with open(args.jsonl, "r", encoding="utf-8") as f:
                 for line in f:
                     if line.strip():
                         source_findings.append(json.loads(line))
         # Or load direct from Nessus (Legacy/Convenience flow)
         elif args.nessus:
-            print(f"[*] Parsing {args.nessus} for direct import...")
+            logger.info(f"Parsing {args.nessus} for direct import...")
+            if not os.path.exists(args.nessus):
+                logger.error(f"File not found: {args.nessus}")
+                sys.exit(1)
             parser_obj = NessusParser(args.nessus)
             parser_obj.parse()
             source_findings = list(parser_obj.to_jsonl_iter())
         else:
             parser.error("--import-findings requires either --jsonl or --nessus input")
 
+        Q_GET_REPORT_FINDINGS = """
+query GetReportFindings($reportId: bigint!) {
+  reportedFinding(where: {reportId: {_eq: $reportId}}) {
+    id
+    title
+  }
+}
+"""
+
+        M_BULK_INSERT = """
+mutation CreateReportedFindings($objects: [reportedFinding_insert_input!]!) {
+  insert_reportedFinding(objects: $objects) {
+    affected_rows
+    returning { id title }
+  }
+}
+"""
+
         if not source_findings:
-            print("[-] No findings found to import.")
+            logger.warning("No findings found to import.")
             return
 
-        print(f"[*] Connecting to {args.gw_url}...")
+        logger.info(f"Connecting to {args.gw_url}...")
         importer = GhostwriterImporter(args.gw_url, args.token, args.verify_ssl, args.timeout)
-        importer.connect_and_check_auth()
-        importer.load_severity_map()
+        try:
+            importer.connect_and_check_auth()
+            importer.load_severity_map()
+            if not args.dry_run:
+                findings_data = importer._gql("GetReportFindings", Q_GET_REPORT_FINDINGS, {"reportId": args.report_id})
+                existing = findings_data.get("reportedFinding", [])
+                importer.existing_findings_cache = {f["title"]: f["id"] for f in existing}
+                logger.info(f"Cached {len(importer.existing_findings_cache)} existing findings for optimization.")
+        except Exception as e:
+            logger.critical(f"Connection/Setup failed: {e}")
+            sys.exit(1)
         
-        print(f"[*] Importing {len(source_findings)} findings...")
-        for i, finding in enumerate(source_findings, 1):
-            try:
-                importer.import_finding(finding, args.report_id, args.finding_type_id, args.dry_run)
-                if args.sleep > 0:
-                    time.sleep(args.sleep)
-            except Exception as e:
-                print(f"[!] Error importing finding '{finding.get('title', 'Unknown')}': {e}")
-                # Optional: Continue or break? For bulk imports, often better to continue and log errors.
-                # We'll continue for now.
+        logger.info(f"Processing {len(source_findings)} findings...")
+        
+        to_create = []
+        to_update = []
+        
+        # Prepare objects
+        for finding in source_findings:
+            # Map severity
+            sev_label = finding.get("severity_label", "informational")
+            severity_id = importer.severity_map.get(sev_label, importer.severity_map.get("informational"))
+            title = finding["title"]
+            
+            obj = {
+                "reportId": args.report_id,
+                "findingTypeId": args.finding_type_id,
+                "severityId": severity_id,
+                "title": title,
+                "description": finding["description"],
+                "mitigation": finding["mitigation"],
+                "impact": finding["impact"],
+                "replication_steps": finding["replication_steps"],
+                "affectedEntities": finding["affectedEntities"],
+                "references": finding["references"],
+                "extraFields": finding.get("extraFields", {})
+            }
+            if "extraFields" not in finding:
+                 obj["extraFields"] = {
+                     "nessus": {
+                         "plugin_id": finding.get("plugin_id"), 
+                         "severity_num": finding.get("severity_num")
+                     }
+                 }
+            
+            existing_id = importer.check_existing_finding(args.report_id, title)
+            if existing_id:
+                to_update.append((existing_id, obj))
+            else:
+                to_create.append(obj)
+
+        # Bulk Insert New
+        if to_create:
+            logger.info(f"Bulk inserting {len(to_create)} new findings...")
+            if args.dry_run:
+                for obj in to_create:
+                    logger.info(f"[Dry Run] Would insert: {obj['title']}")
+            else:
+                try:
+                    # GraphQL Mutation for Bulk
+                    # We reuse M_BULK_INSERT defined above (ensure it's added to constants)
+                    data = importer._gql("CreateReportedFindings", M_BULK_INSERT, {"objects": to_create})
+                    count = data["insert_reportedFinding"]["affected_rows"]
+                    logger.info(f"Successfully bulk created {count} findings.")
+                except Exception as e:
+                    logger.error(f"Bulk insert failed: {e}")
+
+        # Sequential Update
+        if to_update:
+            logger.info(f"Updating {len(to_update)} existing findings...")
+            for existing_id, obj in to_update:
+                if args.dry_run:
+                    logger.info(f"[Dry Run] Would update: {obj['title']}")
+                    continue
+                
+                try:
+                    update_obj = obj.copy()
+                    del update_obj["reportId"]
+                    importer._gql("UpdateReportedFinding", M_UPDATE, {"id": existing_id, "obj": update_obj})
+                    logger.info(f"Updated: {existing_id} - {obj['title']}")
+                    if args.sleep > 0:
+                        time.sleep(args.sleep)
+                except Exception as e:
+                    logger.error(f"Update failed for '{obj['title']}': {e}")
+
 
 if __name__ == "__main__":
     main()
