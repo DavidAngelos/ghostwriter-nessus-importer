@@ -157,6 +157,10 @@ class NessusParser:
         severity_num = int(item.get("severity") or 0)
         port = item.get("port") or "0"
         proto = item.get("protocol") or "tcp"
+        
+        # Skip informational findings (severity 0) - only process Low (1) and above
+        if severity_num == 0:
+            return
 
         if plugin_id not in self.findings:
             description_text = (item.findtext("description") or "").strip()
