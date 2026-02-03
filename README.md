@@ -34,7 +34,28 @@ GW_TOKEN=your-bearer-token
 GW_REPORT_ID=your-report-id
 ```
 
-## Usage
+## Web Interface (GUI)
+
+The tool now includes a user-friendly Web UI.
+
+1.  **Install Web Dependencies**:
+    ```bash
+    pip install -r requirements-web.txt
+    ```
+
+2.  **Start the Server**:
+    ```bash
+    python app.py
+    ```
+
+3.  **Use**:
+    Open your browser to `http://localhost:5001`.
+    - **Extract Tab**: Drag-and-drop .nessus files to convert them to JSON.
+    - **Import Tab**: Upload .nessus and/or .json files to import into Ghostwriter.
+
+## Usage (CLI)
+
+This tool has two main modes:
 
 ### Extract Mode
 
