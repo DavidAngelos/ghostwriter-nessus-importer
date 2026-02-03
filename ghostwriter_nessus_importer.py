@@ -63,6 +63,18 @@ mutation UpdateReportedFinding($id: bigint!, $obj: reportedFinding_set_input!) {
 }
 """
 
+M_BULK_INSERT = """
+mutation CreateReportedFindings($objects: [reportedFinding_insert_input!]!) {
+  insert_reportedFinding(objects: $objects) {
+    affected_rows
+    returning {
+      id
+      title
+    }
+  }
+}
+"""
+
 
 # --- Helper Functions (Formatting) ---
 
@@ -358,7 +370,26 @@ class GhostwriterImporter:
             rid = data["insert_reportedFinding_one"]["id"]
             rtitle = data["insert_reportedFinding_one"]["title"]
             logger.info(f"Created: {rid} - {rtitle}")
+    def bulk_insert_findings(self, findings: List[Dict[str, Any]]) -> int:
+        """
+        Bulk insert findings using GraphQL.
+        Returns number of affected rows.
+        """
+        if not findings:
+            return 0
+            
+        data = self._gql("CreateReportedFindings", M_BULK_INSERT, {"objects": findings})
+        return data["insert_reportedFinding"]["affected_rows"]
 
+    def update_finding(self, finding_id: int, finding_data: Dict[str, Any]) -> None:
+        """
+        Update a single finding by ID.
+        """
+        update_obj = finding_data.copy()
+        if "reportId" in update_obj:
+            del update_obj["reportId"]
+            
+        self._gql("UpdateReportedFinding", M_UPDATE, {"id": finding_id, "obj": update_obj})
 
 # --- Main ---
 
@@ -608,10 +639,7 @@ mutation CreateReportedFindings($objects: [reportedFinding_insert_input!]!) {
                     logger.info(f"  > extraFields: {json.dumps(obj.get('extraFields', {}), indent=2)}")
             else:
                 try:
-                    # GraphQL Mutation for Bulk
-                    # We reuse M_BULK_INSERT defined above (ensure it's added to constants)
-                    data = importer._gql("CreateReportedFindings", M_BULK_INSERT, {"objects": to_create})
-                    count = data["insert_reportedFinding"]["affected_rows"]
+                    count = importer.bulk_insert_findings(to_create)
                     logger.info(f"Successfully bulk created {count} findings.")
                 except Exception as e:
                     logger.error(f"Bulk insert failed: {e}")
@@ -625,9 +653,7 @@ mutation CreateReportedFindings($objects: [reportedFinding_insert_input!]!) {
                     continue
                 
                 try:
-                    update_obj = obj.copy()
-                    del update_obj["reportId"]
-                    importer._gql("UpdateReportedFinding", M_UPDATE, {"id": existing_id, "obj": update_obj})
+                    importer.update_finding(existing_id, obj)
                     logger.info(f"Updated: {existing_id} - {obj['title']}")
                     if args.sleep > 0:
                         time.sleep(args.sleep)
