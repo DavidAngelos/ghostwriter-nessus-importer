@@ -367,12 +367,12 @@ def main():
     
     # Common arguments
     parser.add_argument("--nessus", help="Path to .nessus input file")
-    parser.add_argument("--jsonl", help="Path to .jsonl input/output file")
+    parser.add_argument("--json", help="Path to .json input/output file")
     
     # Mode selection
     mode_group = parser.add_mutually_exclusive_group(required=True)
-    mode_group.add_argument("--extract", action="store_true", help="Parse .nessus and save to --jsonl")
-    mode_group.add_argument("--import-findings", action="store_true", help="Import findings from --jsonl (or --nessus) to Ghostwriter")
+    mode_group.add_argument("--extract", action="store_true", help="Parse .nessus and save to --json")
+    mode_group.add_argument("--import-findings", action="store_true", help="Import findings from --json (or --nessus) to Ghostwriter")
     
     # API args (can come from Env)
     api_group = parser.add_argument_group("Ghostwriter API", "Required for --import-findings")
@@ -400,18 +400,20 @@ def main():
             logger.error(f"Failed to parse Nessus file: {e}")
             sys.exit(1)
         
-        output_file = args.jsonl or "nessus_findings.jsonl"
+        output_file = args.json or "nessus_findings.json"
         logger.info(f"Writing fields to {output_file}...")
         
-        count = 0
+        findings = []
+        for finding in parser_obj.to_jsonl_iter():
+            # Redact sensitive info for AI workflow
+            finding["affectedEntities"] = ""
+            finding["replication_steps"] = ""
+            findings.append(finding)
+            
         with open(output_file, "w", encoding="utf-8") as f:
-            for finding in parser_obj.to_jsonl_iter():
-                # Redact sensitive info for AI workflow
-                finding["affectedEntities"] = ""
-                finding["replication_steps"] = ""
-                f.write(json.dumps(finding) + "\n")
-                count += 1
-        logger.info(f"Extracted {count} findings.")
+            json.dump(findings, f, indent=2)
+
+        logger.info(f"Extracted {len(findings)} findings.")
 
     # --- IMPORT MODE ---
     elif args.import_findings:
@@ -425,18 +427,25 @@ def main():
         jsonl_findings_map = {}
         nessus_findings_map = {}
 
-        # 1. Load JSONL (Enrichment Source - AI-edited text)
-        if args.jsonl:
-            logger.info(f"Loading enrichment data from {args.jsonl}...")
-            if not os.path.exists(args.jsonl):
-                logger.error(f"File not found: {args.jsonl}")
+        # 1. Load JSON (Enrichment Source - AI-edited text)
+        if args.json:
+            logger.info(f"Loading enrichment data from {args.json}...")
+            if not os.path.exists(args.json):
+                logger.error(f"File not found: {args.json}")
                 sys.exit(1)
-            with open(args.jsonl, "r", encoding="utf-8") as f:
-                for line in f:
-                    if line.strip():
-                        obj = json.loads(line)
+            try:
+                with open(args.json, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if not isinstance(data, list):
+                        logger.error("JSON file must contain a list of finding objects")
+                        sys.exit(1)
+                    
+                    for obj in data:
                         if "plugin_id" in obj:
                             jsonl_findings_map[obj["plugin_id"]] = obj
+            except json.JSONDecodeError as e:
+                logger.error(f"Invalid JSON format in {args.json}: {e}")
+                sys.exit(1)
         
         # 2. Load Nessus (Technical Source - hosts, outputs, etc.)
         if args.nessus:
@@ -450,43 +459,39 @@ def main():
                 nessus_findings_map[obj["plugin_id"]] = obj
 
         # 3. Merge Strategy
-        if args.jsonl and args.nessus:
-            logger.info("Merging Nessus technical data with JSONL enrichment...")
+        if args.json and args.nessus:
+            logger.info("Merging Nessus technical data with JSON enrichment...")
             # Nessus provides: affectedEntities, replication_steps (technical data)
-            # JSONL provides: title, description, mitigation (AI-enriched text)
+            # JSON provides: title, description, mitigation (AI-enriched text)
             
             for pid, tech_finding in nessus_findings_map.items():
                 if pid in jsonl_findings_map:
                     enrichment = jsonl_findings_map[pid]
                     merged = tech_finding.copy()
                     
-                    # Overlay enriched text fields from JSONL
-                    merged["title"] = enrichment.get("title", merged["title"])
-                    merged["description"] = enrichment.get("description", merged["description"])
-                    merged["mitigation"] = enrichment.get("mitigation", merged["mitigation"])
-                    merged["impact"] = enrichment.get("impact", merged["impact"])
-                    merged["references"] = enrichment.get("references", merged["references"])
-                    merged["severity_label"] = enrichment.get("severity_label", merged["severity_label"])
-                    merged["extraFields"] = enrichment.get("extraFields", merged.get("extraFields"))
-                    
-                    # Only override technical data if JSONL explicitly provides non-empty values
-                    if enrichment.get("affectedEntities"):
-                        merged["affectedEntities"] = enrichment["affectedEntities"]
-                    if enrichment.get("replication_steps"):
-                        merged["replication_steps"] = enrichment["replication_steps"]
+                    # Merge enrichment data
+                    for key, value in enrichment.items():
+                        # Special handling for technical fields we don't want to wipe out if empty in JSON
+                        if key in ["affectedEntities", "replication_steps"]:
+                            if value:
+                                merged[key] = value
+                        # For everything else (title, description, custom fields like remediation_cost), 
+                        # we want the enrichment version to take precedence.
+                        else:
+                            merged[key] = value
                         
                     source_findings.append(merged)
                 else:
-                    # In Nessus but not in JSONL - import as-is
+                    # In Nessus but not in JSON - import as-is
                     source_findings.append(tech_finding)
             
-            # Check for findings in JSONL but NOT in Nessus (manual additions)
+            # Check for findings in JSON but NOT in Nessus (manual additions)
             for pid, enrich in jsonl_findings_map.items():
                 if pid not in nessus_findings_map:
                     source_findings.append(enrich)
 
-        # Case: Only JSONL provided
-        elif args.jsonl:
+        # Case: Only JSON provided
+        elif args.json:
             source_findings = list(jsonl_findings_map.values())
             
         # Case: Only Nessus provided
@@ -494,7 +499,7 @@ def main():
              source_findings = list(nessus_findings_map.values())
              
         else:
-            parser.error("--import-findings requires either --jsonl or --nessus input (or both for merge!)")
+            parser.error("--import-findings requires either --json or --nessus input (or both for merge!)")
 
         Q_GET_REPORT_FINDINGS = """
 query GetReportFindings($reportId: bigint!) {
@@ -544,6 +549,7 @@ mutation CreateReportedFindings($objects: [reportedFinding_insert_input!]!) {
             severity_id = importer.severity_map.get(sev_label, importer.severity_map.get("informational"))
             title = finding["title"]
             
+            # Core required fields
             obj = {
                 "reportId": args.report_id,
                 "findingTypeId": args.finding_type_id,
@@ -555,15 +561,37 @@ mutation CreateReportedFindings($objects: [reportedFinding_insert_input!]!) {
                 "replication_steps": finding.get("replication_steps", ""),
                 "affectedEntities": finding.get("affectedEntities", ""),
                 "references": finding.get("references", "<p></p>"),
-                "extraFields": finding.get("extraFields", {})
             }
-            if "extraFields" not in finding:
-                 obj["extraFields"] = {
-                     "nessus": {
-                         "plugin_id": finding.get("plugin_id"), 
-                         "severity_num": finding.get("severity_num")
-                     }
-                 }
+            
+            # Pass through additional custom fields from enriched JSON
+            # These are fields like ease_of_detection, remediation_cost, remediation_short, etc.
+            # GW schema doesn't have these on root, so we MUST put them in extraFields.
+            custom_extra_fields = {}
+            core_fields = {
+                "plugin_id", "severity_num", "severity_label", "title", "description", 
+                "mitigation", "impact", "replication_steps", "affectedEntities", "references",
+                "raw_description", "raw_mitigation", "risk_factor", "extraFields"
+            }
+            for key, value in finding.items():
+                if key not in core_fields:
+                    custom_extra_fields[key] = value
+            
+            # Prepare final extraFields
+            # 1. Start with any explicit extraFields from JSON
+            existing_extra = finding.get("extraFields")
+            final_extra_fields = (existing_extra if existing_extra is not None else {}).copy()
+            
+            # 2. Add Nessus metadata if not present
+            if "nessus" not in final_extra_fields:
+                final_extra_fields["nessus"] = {
+                    "plugin_id": finding.get("plugin_id"), 
+                    "severity_num": finding.get("severity_num")
+                }
+            
+            # 3. Merge in our discovered custom fields
+            final_extra_fields.update(custom_extra_fields)
+            
+            obj["extraFields"] = final_extra_fields
             
             existing_id = importer.check_existing_finding(args.report_id, title)
             if existing_id:
@@ -577,6 +605,7 @@ mutation CreateReportedFindings($objects: [reportedFinding_insert_input!]!) {
             if args.dry_run:
                 for obj in to_create:
                     logger.info(f"[Dry Run] Would insert: {obj['title']}")
+                    logger.info(f"  > extraFields: {json.dumps(obj.get('extraFields', {}), indent=2)}")
             else:
                 try:
                     # GraphQL Mutation for Bulk

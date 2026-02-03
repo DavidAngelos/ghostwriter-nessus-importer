@@ -7,11 +7,12 @@ A Python-based pipeline for importing Nessus vulnerability scan results into the
 - Parse Nessus XML files and extract vulnerability findings
 - Group findings by Plugin ID with aggregated affected entities
 - Filter findings by severity (Low and above; informational findings excluded)
-- Export findings to JSONL format for review and enrichment
+- Export findings to standard JSON format for review and enrichment
 - Import findings to Ghostwriter with automatic duplicate detection
-- Merge technical data from Nessus with enriched content from JSONL
+- Merge technical data from Nessus with enriched content from JSON
 - Bulk insert operations for optimized performance
 - Update existing findings instead of creating duplicates
+- **Custom Field Support**: Automatically maps non-standard fields (e.g., `ease_of_detection`, `remediation_cost`) to Ghostwriter's `extraFields` JSONB column.
 
 ## Requirements
 
@@ -37,18 +38,18 @@ GW_REPORT_ID=your-report-id
 
 ### Extract Mode
 
-Parse a Nessus file and export findings to JSONL:
+Parse a Nessus file and export findings to JSON:
 
 ```bash
-python ghostwriter_nessus_importer.py --extract --nessus scan.nessus --jsonl findings.jsonl
+python ghostwriter_nessus_importer.py --extract --nessus scan.nessus --json findings.json
 ```
 
 ### Import Mode
 
-Import findings from JSONL to Ghostwriter:
+Import findings from JSON to Ghostwriter:
 
 ```bash
-python ghostwriter_nessus_importer.py --import-findings --jsonl findings.jsonl --gw-url https://... --token ... --report-id 123
+python ghostwriter_nessus_importer.py --import-findings --json findings.json --gw-url https://... --token ... --report-id 123
 ```
 
 Import directly from Nessus file:
@@ -57,10 +58,10 @@ Import directly from Nessus file:
 python ghostwriter_nessus_importer.py --import-findings --nessus scan.nessus --gw-url https://... --token ... --report-id 123
 ```
 
-Merge Nessus technical data with enriched JSONL content:
+Merge Nessus technical data with enriched JSON content:
 
 ```bash
-python ghostwriter_nessus_importer.py --import-findings --nessus scan.nessus --jsonl enriched.jsonl --gw-url https://... --token ... --report-id 123
+python ghostwriter_nessus_importer.py --import-findings --nessus scan.nessus --json enriched.json --gw-url https://... --token ... --report-id 123
 ```
 
 ### Additional Options
@@ -73,9 +74,9 @@ python ghostwriter_nessus_importer.py --import-findings --nessus scan.nessus --j
 
 ## Workflow
 
-1. **Extract**: Parse Nessus file and generate JSONL for review
-2. **Enrich** (Optional): Edit JSONL to improve descriptions, mitigation steps, or add custom fields
-3. **Import**: Upload findings to Ghostwriter with merge support for enriched content
+1. **Extract**: Parse Nessus file and generate standard JSON for review
+2. **Enrich** (Optional): Edit the JSON file to improve descriptions, mitigation steps, or add custom fields. Ensure `plugin_id` is preserved.
+3. **Import**: Upload findings to Ghostwriter with merge support (nessus + json) for enriched content
 
 ## Data Processing
 
@@ -85,6 +86,7 @@ python ghostwriter_nessus_importer.py --import-findings --nessus scan.nessus --j
 - Plugin outputs are limited to 2 samples per finding
 - HTML formatting is applied for compatibility with Ghostwriter DOCX export
 - Only findings with severity Low (1) or higher are processed
+- **Custom Fields**: Any fields in the JSON that are not part of the standard Ghostwriter schema (e.g. `remediation_cost`) will be automatically moved to the `extraFields` property during import.
 
 ## License
 
