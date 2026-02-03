@@ -63,6 +63,15 @@ mutation UpdateReportedFinding($id: bigint!, $obj: reportedFinding_set_input!) {
 }
 """
 
+Q_GET_REPORT_FINDINGS = """
+query GetReportFindings($reportId: bigint!) {
+  reportedFinding(where: {reportId: {_eq: $reportId}}) {
+    id
+    title
+  }
+}
+"""
+
 M_BULK_INSERT = """
 mutation CreateReportedFindings($objects: [reportedFinding_insert_input!]!) {
   insert_reportedFinding(objects: $objects) {
@@ -391,6 +400,15 @@ class GhostwriterImporter:
             
         self._gql("UpdateReportedFinding", M_UPDATE, {"id": finding_id, "obj": update_obj})
 
+    def populate_existing_findings_cache(self, report_id: int) -> None:
+        """
+        Fetch all existing findings for the report and populate the cache.
+        """
+        data = self._gql("GetReportFindings", Q_GET_REPORT_FINDINGS, {"reportId": report_id})
+        existing = data.get("reportedFinding", [])
+        self.existing_findings_cache = {f["title"]: f["id"] for f in existing}
+        logger.info(f"Cached {len(self.existing_findings_cache)} existing findings.")
+
 # --- Main ---
 
 def main():
@@ -532,23 +550,9 @@ def main():
         else:
             parser.error("--import-findings requires either --json or --nessus input (or both for merge!)")
 
-        Q_GET_REPORT_FINDINGS = """
-query GetReportFindings($reportId: bigint!) {
-  reportedFinding(where: {reportId: {_eq: $reportId}}) {
-    id
-    title
-  }
-}
-"""
 
-        M_BULK_INSERT = """
-mutation CreateReportedFindings($objects: [reportedFinding_insert_input!]!) {
-  insert_reportedFinding(objects: $objects) {
-    affected_rows
-    returning { id title }
-  }
-}
-"""
+
+
 
         if not source_findings:
             logger.warning("No findings found to import.")
@@ -560,9 +564,7 @@ mutation CreateReportedFindings($objects: [reportedFinding_insert_input!]!) {
             importer.connect_and_check_auth()
             importer.load_severity_map()
             if not args.dry_run:
-                findings_data = importer._gql("GetReportFindings", Q_GET_REPORT_FINDINGS, {"reportId": args.report_id})
-                existing = findings_data.get("reportedFinding", [])
-                importer.existing_findings_cache = {f["title"]: f["id"] for f in existing}
+                importer.populate_existing_findings_cache(args.report_id)
                 logger.info(f"Cached {len(importer.existing_findings_cache)} existing findings for optimization.")
         except Exception as e:
             logger.critical(f"Connection/Setup failed: {e}")

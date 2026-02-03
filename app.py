@@ -530,6 +530,15 @@ def import_submit():
         importer = GhostwriterImporter(gw_url, gw_token, verify_ssl=False)
         importer.load_severity_map()
         
+        # KEY FIX: Populate cache to prevent duplicates!
+        # Always populate cache even in dry run to correctly simulate "Would update"
+        try:
+             importer.populate_existing_findings_cache(int(report_id))
+        except Exception as e:
+             # If connection fails, log it but maybe continue?
+             print(f"Cache population warning: {e}")
+             pass
+        
         # We need to capture logs instead of print
         log_capture = []
         
