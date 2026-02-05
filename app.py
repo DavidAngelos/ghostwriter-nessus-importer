@@ -96,6 +96,7 @@ STYLE_CSS = """
         .grid-layout { display: grid; grid-template-columns: minmax(0, 1.8fr) minmax(0, 1.2fr); gap: 22px; }
         
         .dropzone {
+            display: block;
             border: 1px solid var(--border-soft); background: var(--bg-elevated);
             border-radius: var(--radius-lg); padding: 20px; cursor: pointer;
             transition: 0.15s ease;
@@ -280,7 +281,7 @@ IMPORT_HTML = """
                 <div class="title">Ghostwriter Nessus Importer</div>
                 <div class="subtitle">Import findings (Nessus and/or JSON) into Ghostwriter</div>
             </div>
-            <div class="pill">v1.1</div>
+            <div class="pill">v1.2</div>
         </div>
 
         <div class="tabs">
@@ -288,15 +289,17 @@ IMPORT_HTML = """
             <a class="tab active" href="{{ url_for('import_page') }}">Import to Ghostwriter</a>
         </div>
 
-        {% with messages = get_flashed_messages(with_categories=true) %}
-          {% if messages %}
-            {% for category, msg in messages %}
-              <div class="flash flash-{{ category }}">{{ msg|safe }}</div>
-            {% endfor %}
-          {% endif %}
-        {% endwith %}
+        <div id="flash-container">
+            {% with messages = get_flashed_messages(with_categories=true) %}
+              {% if messages %}
+                {% for category, msg in messages %}
+                  <div class="flash flash-{{ category }}">{{ msg|safe }}</div>
+                {% endfor %}
+              {% endif %}
+            {% endwith %}
+        </div>
 
-        <form method="POST" action="{{ url_for('import_submit') }}" enctype="multipart/form-data">
+        <form id="import-form" method="POST" action="{{ url_for('import_submit') }}" enctype="multipart/form-data">
             <div class="grid-layout">
                 <div style="display:flex; flex-direction:column; gap:15px;">
                     <label class="dropzone" id="dz-nessus">
@@ -325,15 +328,15 @@ IMPORT_HTML = """
                     
                     <div class="field-group">
                         <div class="field-label">GraphQL URL</div>
-                        <input type="text" class="text-input" name="gw_url" placeholder="https://gw.example.com/v1/graphql" value="{{ default_url }}">
+                        <input type="text" class="text-input" id="inp-url" name="gw_url" placeholder="https://gw.example.com/v1/graphql" value="{{ default_url }}">
                     </div>
                      <div class="field-group">
                         <div class="field-label">Bearer Token</div>
-                        <input type="password" class="text-input" name="gw_token" placeholder="Bearer Token">
+                        <input type="password" class="text-input" id="inp-token" name="gw_token" placeholder="Bearer Token">
                     </div>
                      <div class="field-group">
                         <div class="field-label">Report ID</div>
-                        <input type="number" class="text-input" name="report_id" placeholder="123" value="{{ default_rid }}">
+                        <input type="number" class="text-input" id="inp-rid" name="report_id" placeholder="123" value="{{ default_rid }}">
                     </div>
                     
                     <div class="side-title" style="margin-top:15px">Options</div>
@@ -342,14 +345,20 @@ IMPORT_HTML = """
                         <label for="dry_run">Dry Run (Simulate only)</label>
                     </div>
                      <div class="field-group" style="margin-top:10px">
-                        <div class="field-label">Or upload .env file</div>
-                        <input type="file" name="env_file" accept=".env" style="display:block; font-size:0.8rem; color:var(--muted)">
+                        <div class="field-label">Or drop .env file here to auto-fill</div>
+                        <label class="dropzone" id="dz-env" style="padding: 10px; border-style: dashed; min-height: 60px;">
+                            <div style="font-size: 0.8rem; text-align: center; color: var(--muted);" id="lbl-env">
+                                Drop .env
+                            </div>
+                            <!-- Hidden input purely for drag-drop logic, not sent to server now we parse client side -->
+                            <input type="file" id="env-file-input" accept=".env"> 
+                        </label>
                     </div>
                 </div>
             </div>
 
             <div class="actions">
-                <button type="submit" class="btn-primary">Start Import</button>
+                <button type="submit" id="btn-submit" class="btn-primary">Start Import</button>
             </div>
         </form>
     </div>
@@ -361,8 +370,13 @@ IMPORT_HTML = """
         const lbl = document.getElementById(labelId);
         
         inp.addEventListener('change', () => {
-            if(inp.files.length > 0) lbl.textContent = inp.files[0].name;
-            else lbl.textContent = defaultText;
+            if(inp.files.length > 0) {
+                lbl.textContent = inp.files[0].name;
+                dz.classList.add('active-file'); 
+            } else {
+                lbl.textContent = defaultText;
+                dz.classList.remove('active-file');
+            }
         });
         
         ['dragenter', 'dragover'].forEach(evt => {
@@ -376,12 +390,110 @@ IMPORT_HTML = """
             if(files.length > 0) {
                 inp.files = files;
                 lbl.textContent = files[0].name;
+                dz.classList.add('active-file');
             }
         });
     }
     
     setupDropzone('dz-nessus', 'nessus-file', 'lbl-nessus', 'Drop .nessus file (Optional)');
     setupDropzone('dz-json', 'json-file', 'lbl-json', 'Drop .json file (Optional)');
+
+    // --- .ENV Parsing Logic ---
+    const dzEnv = document.getElementById('dz-env');
+    const lblEnv = document.getElementById('lbl-env');
+
+    ['dragenter', 'dragover'].forEach(evt => {
+        dzEnv.addEventListener(evt, (e) => { e.preventDefault(); e.stopPropagation(); dzEnv.classList.add('dragover'); });
+    });
+     ['dragleave', 'dragend', 'drop'].forEach(evt => {
+        dzEnv.addEventListener(evt, (e) => { e.preventDefault(); e.stopPropagation(); dzEnv.classList.remove('dragover'); });
+    });
+
+    dzEnv.addEventListener('drop', (e) => {
+        const files = e.dataTransfer.files;
+        if(files.length > 0) {
+            parseEnvFile(files[0]);
+        }
+    });
+    
+    // Also support clicking to select
+    document.getElementById('env-file-input').addEventListener('change', (e) => {
+        if(e.target.files.length > 0) parseEnvFile(e.target.files[0]);
+    });
+
+    function parseEnvFile(file) {
+        lblEnv.textContent = "Parsing " + file.name + "...";
+        const reader = new FileReader();
+        reader.onload = function(e) {
+            const text = e.target.result;
+            const lines = text.split(/\\r?\\n/);
+            let found = 0;
+            lines.forEach(line => {
+                const match = line.match(/^\\s*([A-Z_]+)\\s*=\\s*(.*)$/);
+                if(match) {
+                    const key = match[1];
+                    let val = match[2].trim();
+                    // Remove quotes if present
+                    if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+                        val = val.slice(1, -1);
+                    }
+                    
+                    if(key === 'GW_URL') document.getElementById('inp-url').value = val;
+                    if(key === 'GW_TOKEN') document.getElementById('inp-token').value = val;
+                    if(key === 'GW_REPORT_ID') document.getElementById('inp-rid').value = val;
+                    found++;
+                }
+            });
+            lblEnv.textContent = `Loaded ${found} vars from ${file.name}`;
+            setTimeout(() => lblEnv.textContent = "Drop .env", 3000);
+        };
+        reader.readAsText(file);
+    }
+
+    // --- AJAX Form Submission ---
+    const form = document.getElementById('import-form');
+    form.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const btn = document.getElementById('btn-submit');
+        const flashContainer = document.getElementById('flash-container');
+        
+        // Reset UI
+        btn.disabled = true;
+        btn.textContent = "Processing...";
+        flashContainer.innerHTML = "";
+
+        const formData = new FormData(form);
+        // Add ajax flag
+        formData.append('ajax', '1');
+
+        try {
+            const response = await fetch(form.action, {
+                method: 'POST',
+                body: formData
+            });
+            
+            const data = await response.json();
+            
+            // Render message
+            const div = document.createElement('div');
+            div.className = `flash flash-${data.category}`;
+            div.innerHTML = data.message;
+            flashContainer.appendChild(div);
+            
+            // Scroll to top
+            window.scrollTo({ top: 0, behavior: 'smooth' });
+            
+        } catch (err) {
+            const div = document.createElement('div');
+            div.className = 'flash flash-error';
+            div.textContent = "Request failed: " + err;
+            flashContainer.appendChild(div);
+        } finally {
+            btn.disabled = false;
+            btn.textContent = "Start Import";
+        }
+    });
+
 </script>
 </body>
 </html>
@@ -434,10 +546,20 @@ def extract_submit():
 
 @app.route("/import_run", methods=["POST"])
 def import_submit():
+    # Helper for response logic
+    is_ajax = request.form.get("ajax") == "1"
+    
+    def respond(msg, category="success"):
+        if is_ajax:
+            return {"message": msg, "category": category}
+        else:
+            flash(msg, category)
+            return redirect(url_for("import_page"))
+
     # 1. Handle Credentials (Form > Env File > System Env)
     env_vars = {}
     
-    # Check for uploaded .env
+    # Check for uploaded .env (Legacy server-side support, though client now preferred)
     env_file = request.files.get("env_file")
     if env_file and env_file.filename:
         from io import TextIOWrapper
@@ -453,16 +575,14 @@ def import_submit():
     report_id = request.form.get("report_id") or env_vars.get("GW_REPORT_ID")
     
     if not all([gw_url, gw_token, report_id]):
-        flash("Missing Credentials: GW URL, Token, and Report ID are required.", "error")
-        return redirect(url_for("import_page"))
+        return respond("Missing Credentials: GW URL, Token, and Report ID are required.", "error")
 
     # 2. Handle Inputs
     nessus_f = request.files.get("nessus_file")
     json_f = request.files.get("json_file")
     
     if (not nessus_f or not nessus_f.filename) and (not json_f or not json_f.filename):
-        flash("Please upload at least one file (.nessus or .json).", "error")
-        return redirect(url_for("import_page"))
+        return respond("Please upload at least one file (.nessus or .json).", "error")
         
     temp_dir = tempfile.mkdtemp(prefix="gw_import_")
     
@@ -515,18 +635,6 @@ def import_submit():
                 source_findings.append(enrich)
         
         # Initialize Importer
-        # Mocking args object simply
-        class MockArgs:
-            def __init__(self):
-                self.gw_url = gw_url
-                self.token = gw_token
-                self.report_id = int(report_id)
-                self.finding_type_id = 1
-                self.dry_run = "dry_run" in request.form
-                self.verify_ssl = False # Default to false for ease of use in most internal envs
-                self.sleep = 0
-                self.timeout = 60
-
         importer = GhostwriterImporter(gw_url, gw_token, verify_ssl=False)
         importer.load_severity_map()
         
@@ -539,14 +647,6 @@ def import_submit():
              print(f"Cache population warning: {e}")
              pass
         
-        # We need to capture logs instead of print
-        log_capture = []
-        
-        # Redirect logger temporarily or just modify logic?
-        # A simpler way is to make the run() method return a summary or we catch stdout
-        # For now, let's just run it, capturing exceptions
-        
-        # We'll use a slightly modified logical block from main() here to allow better feedback
         processed_count = 0
         created_count = 0
         updated_count = 0
@@ -632,15 +732,12 @@ def import_submit():
                       New: {len(to_create)}<br>
                       Updates: {len(to_update)}<br>
                       <pre>{dry_run_log}</pre>"""
-            flash(msg, "info")
+            return respond(msg, "info")
         else:
-            flash(f"<b>Import Complete!</b><br>Created: {created_count}<br>Updated: {updated_count}", "success")
+            return respond(f"<b>Import Complete!</b><br>Created: {created_count}<br>Updated: {updated_count}", "success")
             
-        return redirect(url_for("import_page"))
-        
     except Exception as e:
-        flash(f"Import Failed: {str(e)}", "error")
-        return redirect(url_for("import_page"))
+        return respond(f"Import Failed: {str(e)}", "error")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5001, debug=True)
